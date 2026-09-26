@@ -66,7 +66,7 @@ def run_realtime_inference(model_path="asl_model.p", task_path="hand_landmarker.
         result_callback=print_result_callback
     )
 
-    cap = cv2.VideoCapture(0)  # Laptop built-in webcam
+    cap = cv2.VideoCapture(1)  # Laptop built-in webcam
     if not cap.isOpened():
         print("Error: Could not access laptop webcam.")
         return
