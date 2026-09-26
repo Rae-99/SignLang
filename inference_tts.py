@@ -30,6 +30,12 @@ def tts_worker():
             engine = pyttsx3.init()
             engine.setProperty('rate', 150)
             engine.setProperty('volume', 1.0)
+            
+            # --- NEW: SET VOICE TO MICROSOFT MARK ---
+            voices = engine.getProperty('voices')
+            engine.setProperty('voice', voices[4].id) 
+            # ----------------------------------------
+            
             engine.say(text)
             engine.runAndWait()
             del engine
