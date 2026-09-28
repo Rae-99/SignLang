@@ -7,7 +7,6 @@ import mediapipe as mp
 import numpy as np
 import pyttsx3
 import pythoncom
-from collections import deque
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -64,26 +63,94 @@ def normalize_landmarks(hand_landmarks):
     return (shifted_coords / max_val if max_val > 0 else shifted_coords).flatten().tolist()
 
 # =============================================================================
-# 3. DYNAMIC MOTION HEURISTICS ('J' AND 'Z')
+# 3. DYNAMIC MOTION STATE MACHINE ('J' AND 'Z') — velocity-based
 # =============================================================================
-def check_dynamic_gestures(index_buf, pinky_buf):
-    if len(index_buf) < 20:
+# Tunable thresholds (all in normalized 0-1 landmark units, per-frame)
+MOTION_START_THRESH = 0.012   # per-frame speed needed to call a stroke "started"
+MOTION_STOP_THRESH  = 0.006   # per-frame speed below which the hand counts as "still"
+STOP_FRAMES_NEEDED  = 4       # consecutive still frames before the stroke is "done"
+MIN_STROKE_FRAMES   = 6       # strokes shorter than this are treated as noise
+MAX_STROKE_FRAMES   = 45      # abandon a stroke that never settles (~1.5s @ 30fps)
+
+
+class DynamicGestureTracker:
+    """
+    Tracks ONE continuous motion stroke for J / Z using frame-to-frame
+    velocity instead of a fixed-size sliding window.
+
+    A stroke begins the instant speed crosses MOTION_START_THRESH, and it
+    ends — and is classified — only once speed drops back under
+    MOTION_STOP_THRESH and stays there for STOP_FRAMES_NEEDED consecutive
+    frames. That means classification always happens right when the hand
+    has actually stopped moving, regardless of how many frames the stroke
+    took, instead of relying on an arbitrary window that may or may not
+    still contain the motion.
+    """
+
+    def __init__(self):
+        self.active = False
+        self.stroke_index = []   # (x, y) of index tip, recorded during the stroke
+        self.stroke_pinky = []   # (x, y) of pinky tip, recorded during the stroke
+        self.still_count = 0
+        self.frame_count = 0
+
+    def reset(self):
+        self.__init__()
+
+    def update(self, index_pt, pinky_pt, prev_index_pt, prev_pinky_pt):
+        """
+        Call once per frame with the current and previous tip positions
+        (prev_* is None on the first tracked frame, or right after the
+        hand was lost). Returns a committed label ("J"/"Z") on the frame
+        the stroke completes, else None.
+        """
+        if prev_index_pt is None:
+            return None
+
+        idx_speed = np.hypot(index_pt[0] - prev_index_pt[0], index_pt[1] - prev_index_pt[1])
+        pky_speed = np.hypot(pinky_pt[0] - prev_pinky_pt[0], pinky_pt[1] - prev_pinky_pt[1])
+        speed = max(idx_speed, pky_speed)
+
+        if not self.active:
+            if speed > MOTION_START_THRESH:
+                self.active = True
+                self.stroke_index = [index_pt]
+                self.stroke_pinky = [pinky_pt]
+                self.still_count = 0
+                self.frame_count = 0
+            return None
+
+        # Mid-stroke: keep recording the path
+        self.stroke_index.append(index_pt)
+        self.stroke_pinky.append(pinky_pt)
+        self.frame_count += 1
+        self.still_count = self.still_count + 1 if speed < MOTION_STOP_THRESH else 0
+
+        stroke_settled = self.still_count >= STOP_FRAMES_NEEDED
+        stroke_timed_out = self.frame_count >= MAX_STROKE_FRAMES
+
+        if stroke_settled or stroke_timed_out:
+            label = self._classify_stroke() if self.frame_count >= MIN_STROKE_FRAMES else None
+            self.reset()
+            return label
+
         return None
 
-    ix = [p[0] for p in index_buf]
-    iy = [p[1] for p in index_buf]
-    px = [p[0] for p in pinky_buf]
-    py = [p[1] for p in pinky_buf]
+    def _classify_stroke(self):
+        ix = [p[0] for p in self.stroke_index]
+        px = [p[0] for p in self.stroke_pinky]
+        py = [p[1] for p in self.stroke_pinky]
+        iy = [p[1] for p in self.stroke_index]
 
-    # 'J': Pinky moves down and hooks left
-    if (py[-1] - py[0]) > 0.15 and (px[0] - px[-1]) > 0.05:
-        return "J"
+        # 'J': pinky moves down, then hooks left
+        if (py[-1] - py[0]) > 0.15 and (px[0] - px[-1]) > 0.05:
+            return "J"
 
-    # 'Z': Index moves down with horizontal zig-zag
-    if (iy[-1] - iy[0]) > 0.15 and (max(ix) - min(ix)) > 0.15:
-        return "Z"
+        # 'Z': index moves down with a horizontal zig-zag
+        if (iy[-1] - iy[0]) > 0.10 and (max(ix) - min(ix)) > 0.07:
+            return "Z"
 
-    return None
+        return None
 
 # =============================================================================
 # 4. MEDIAPIPE ASYNC CALLBACK
@@ -185,7 +252,8 @@ def draw_progress_ring(frame, center, radius, ratio, color=COLOR_ACCENT, thickne
         cv2.ellipse(frame, center, (radius, radius), -90, 0, 360 * min(1.0, ratio), color, thickness, cv2.LINE_AA)
 
 
-def draw_hud(frame, w, h, current_char, current_word, full_sentence, progress_ratio, hand_tracked):
+def draw_hud(frame, w, h, current_char, current_word, full_sentence, progress_ratio, hand_tracked,
+             flash_label=None, flash_ratio=0.0):
     panel_h = 108
     draw_translucent_panel(frame, 0, h - panel_h, w, h, alpha=0.6)
 
@@ -197,12 +265,28 @@ def draw_hud(frame, w, h, current_char, current_word, full_sentence, progress_ra
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, chip_color, 1, cv2.LINE_AA)
 
     # --- progress ring + current letter badge ---
+    # While a dynamic (J/Z) commit is fresh, flash_ratio fades 1.0 -> 0.0 and
+    # we swap in the committed letter + a gold ring instead of the normal
+    # hold-progress ring, since a motion commit has no "hold" to show.
+    is_flashing = flash_label is not None and flash_ratio > 0.0
     ring_center = (54, h - panel_h + 66)
-    draw_progress_ring(frame, ring_center, 26, progress_ratio, COLOR_ACCENT_2, 4)
-    letter_text = current_char if current_char else "-"
+
+    if is_flashing:
+        flash_color = tuple(int(c * flash_ratio + 60 * (1 - flash_ratio)) for c in COLOR_WARN)
+        draw_progress_ring(frame, ring_center, 26, 1.0, flash_color, 5)
+        letter_text = flash_label
+    else:
+        draw_progress_ring(frame, ring_center, 26, progress_ratio, COLOR_ACCENT_2, 4)
+        letter_text = current_char if current_char else "-"
+
     (tw, th_), _ = cv2.getTextSize(letter_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
     cv2.putText(frame, letter_text, (ring_center[0] - tw // 2, ring_center[1] + th_ // 2),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLOR_TEXT, 2, cv2.LINE_AA)
+
+    if is_flashing:
+        tag = "MOTION"
+        cv2.putText(frame, tag, (ring_center[0] - 24, ring_center[1] + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, COLOR_WARN, 1, cv2.LINE_AA)
 
     # --- word + sentence text ---
     text_x = 100
@@ -254,14 +338,24 @@ def run_translation_system(model_path="asl_model.p", task_path="hand_landmarker.
         print("Error: Could not access laptop webcam.")
         return
 
-    index_history = deque(maxlen=30)
-    pinky_history = deque(maxlen=30)
+    gesture_tracker = DynamicGestureTracker()
+    prev_index_pt = None
+    prev_pinky_pt = None
 
     # Debouncing, hold timers, and auto-complete buffer variables
     current_char = ""
     char_hold_start = 0.0
     HOLD_DURATION = 1.0
     registered_flag = False
+
+    # Dynamic-gesture (J/Z) event tracking — these fire once, not held
+    DYNAMIC_COOLDOWN = 1.2
+    last_dynamic_commit_time = 0.0
+
+    # HUD flash shown briefly when a J/Z commit fires
+    FLASH_DURATION = 0.45
+    flash_label = None
+    flash_started_at = 0.0
 
     current_word = ""
     full_sentence = []
@@ -289,26 +383,43 @@ def run_translation_system(model_path="asl_model.p", task_path="hand_landmarker.
 
             detected_label = None
             x_coords, y_coords = [], []
+            dynamic_committed_this_frame = False
 
             if latest_result and latest_result.hand_landmarks:
                 hand_landmarks = latest_result.hand_landmarks[0]
 
-                index_history.append((hand_landmarks[8].x, hand_landmarks[8].y))
-                pinky_history.append((hand_landmarks[20].x, hand_landmarks[20].y))
+                index_pt = (hand_landmarks[8].x, hand_landmarks[8].y)
+                pinky_pt = (hand_landmarks[20].x, hand_landmarks[20].y)
 
                 norm_features = normalize_landmarks(hand_landmarks)
                 features = np.array(norm_features).reshape(1, -1)
                 predicted_label = classifier.predict(features)[0]
 
-                dyn_label = check_dynamic_gestures(index_history, pinky_history)
-                detected_label = dyn_label if dyn_label else predicted_label
+                # Fires only on the frame a stroke actually settles (velocity-based),
+                # not on an arbitrary fixed window.
+                dyn_label = gesture_tracker.update(index_pt, pinky_pt, prev_index_pt, prev_pinky_pt)
+                now_ts = time.time()
+
+                if dyn_label and (now_ts - last_dynamic_commit_time) > DYNAMIC_COOLDOWN:
+                    detected_label = dyn_label
+                    dynamic_committed_this_frame = True
+                    last_dynamic_commit_time = now_ts
+                elif gesture_tracker.active:
+                    # Mid-stroke: suppress static ML classifier so 'X' doesn't sneak in
+                    detected_label = None
+                else:
+                    detected_label = predicted_label
+
+                prev_index_pt = index_pt
+                prev_pinky_pt = pinky_pt
 
                 for lm in hand_landmarks:
                     x_coords.append(int(lm.x * w))
                     y_coords.append(int(lm.y * h))
             else:
-                index_history.clear()
-                pinky_history.clear()
+                gesture_tracker.reset()
+                prev_index_pt = None
+                prev_pinky_pt = None
 
             # =====================================================================
             # 7. RENDER SKELETON + BOUNDING BOX  (visuals only)
@@ -327,7 +438,18 @@ def run_translation_system(model_path="asl_model.p", task_path="hand_landmarker.
             # 8. DEBOUNCING LOGIC WITH CONSECUTIVE SPACE SENTENCE COMMIT (unchanged)
             # =====================================================================
             now = time.time()
-            if detected_label:
+
+            if dynamic_committed_this_frame:
+                # J/Z: commit instantly, skip the hold timer entirely
+                current_word += detected_label
+                print(f"[Speaking Char]: {detected_label}")
+                speak_async(detected_label)
+                current_char = ""
+                registered_flag = False
+                flash_label = detected_label
+                flash_started_at = now
+
+            elif detected_label:
                 if detected_label == current_char:
                     if not registered_flag and (now - char_hold_start) >= HOLD_DURATION:
                         registered_flag = True
@@ -363,8 +485,11 @@ def run_translation_system(model_path="asl_model.p", task_path="hand_landmarker.
             if detected_label and not registered_flag:
                 progress_ratio = min(1.0, (now - char_hold_start) / HOLD_DURATION)
 
+            flash_ratio = max(0.0, 1.0 - (now - flash_started_at) / FLASH_DURATION) if flash_label else 0.0
+
             draw_hud(frame, w, h, current_char, current_word, full_sentence,
-                     progress_ratio, hand_tracked=bool(x_coords))
+                     progress_ratio, hand_tracked=bool(x_coords),
+                     flash_label=flash_label, flash_ratio=flash_ratio)
 
             cv2.imshow(window_name, frame)
 
@@ -388,4 +513,4 @@ def run_translation_system(model_path="asl_model.p", task_path="hand_landmarker.
     speech_queue.put(None)
 
 if __name__ == "__main__":
-    run_translation_system()    
+    run_translation_system()
