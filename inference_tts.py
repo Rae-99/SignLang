@@ -366,7 +366,8 @@ def run_translation_system(model_path="asl_model.p", task_path="hand_landmarker.
     print(" - Press 'c' to clear word | Shift+'C' to clear sentence | 'q' to quit\n")
 
     window_name = "ASL to Audio Translation"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
+    cv2.resizeWindow(window_name, 1280, 720)
 
     with vision.HandLandmarker.create_from_options(options) as landmarker:
         while cap.isOpened():
