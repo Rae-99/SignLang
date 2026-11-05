@@ -143,7 +143,7 @@ class DynamicGestureTracker:
         iy = [p[1] for p in self.stroke_index]
 
         # 'J': pinky moves down, then hooks left
-        if (py[-1] - py[0]) > 0.15 and (px[0] - px[-1]) > 0.05:
+        if (py[-1] - py[0]) > 0.15 and (px[0] - px[-1]) > 0.1:
             return "J"
 
         # 'Z': index moves down with a horizontal zig-zag
@@ -496,18 +496,20 @@ def run_translation_system(model_path="asl_model.p", task_path="hand_landmarker.
 
             # Granular Keyboard Controls
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            key_char = chr(key).lower() if 0 < key < 128 else ""
+            if key_char == 'q':
                 break
-            elif key == ord('c'):
+            elif key_char == 'c':
+                if key == ord('C'):
+                    current_word = ""
+                    full_sentence.clear()
+                    continue
                 if current_word:
                     current_word = current_word[:-1]  # Remove only the last character
                 elif full_sentence:
                     last_word = full_sentence.pop()  # Remove last word from sentence
                     if last_word:
                         full_sentence.append(last_word[:-1])  # Trim last character from that word
-            elif key == ord('C'):
-                current_word = ""
-                full_sentence.clear()  # Shift+C clears complete sentence history
 
     cap.release()
     cv2.destroyAllWindows()

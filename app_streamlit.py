@@ -61,6 +61,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Streamlit reserves "C" for clearing caches. Stop that browser shortcut outside
+# text inputs so "C" can still be used by the native OpenCV controls.
+st.markdown(
+    """
+    <script>
+    window.addEventListener("keydown", function(event) {
+        const target = event.target;
+        const isTextInput = target instanceof HTMLElement &&
+            (target.closest("input, textarea") || target.isContentEditable);
+        const isClearCacheShortcut = event.key &&
+            event.key.toLowerCase() === "c" &&
+            !event.ctrlKey && !event.metaKey && !event.altKey;
+
+        if (isClearCacheShortcut && !isTextInput) {
+            event.stopImmediatePropagation();
+            event.preventDefault();
+        }
+    }, true);
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Custom High-Tech Dark / Cyberpunk CSS styling
 st.markdown(
     """
